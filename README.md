@@ -22,12 +22,32 @@ The solution follows a layered setup, with ports and adapters for the external s
 ```
 src/
   Transcription.Api             Controller and Program.cs (where everything is registered)
-  Transcription.Application     TranscriptionService and the interfaces it depends on
+  Transcription.Application     TranscriptionService and the interfaces it depends on (Ports)
   Transcription.Domain          Segment model and InvalidAudioException
-  Transcription.Infrastructure  The Azure Speech and ffmpeg implementations
+  Transcription.Infrastructure  The Azure Speech and ffmpeg implementations (Adapters)
 ```
 
 The core logic only talks to two interfaces, `ISpeechToTextService` and `IAudioProcessor`. Azure and ffmpeg plug in behind them, so swapping Azure for something like Whisper means writing one new class and changing one line in `Program.cs`.
+
+## Design decisions
+
+**ffmpeg for audio.** It reads virtually every audio and video format and works the same on Windows, Linux and Docker. Converting everything to 16 kHz mono WAV first means the rest of the code only ever deals with one format, and that's what speech models work best with.
+
+**10-minute chunks.** Splitting keeps every request well within Azure's size and length limits, and keeps a single request from taking too long. Each chunk's timestamps start at 0, so they're shifted by the chunk's position (chunk 2 starts at 1200 s) to match the original recording.
+
+**Ports and adapters.** The core logic depends only on `ISpeechToTextService` and `IAudioProcessor`. Azure and ffmpeg are adapters registered in `Program.cs`. Switching to another provider, such as Whisper or AWS Transcribe, means adding one class and changing one line. It also makes `TranscriptionService` easy to test with fakes.
+
+**Synchronous for now.** The request waits until the transcript is ready. That keeps things simple, but it isn't ideal for very long files. See below for how I'd change that.
+
+## Going to production
+
+For real traffic, I'd move to a job-based design:
+
+- **Uploads:** The API returns a short-lived, write-only SAS URL, and the client uploads straight to Azure Blob Storage. Event Grid signals when an upload is finished.
+- **Processing:** Each upload becomes a job on an Azure Service Bus queue. Background workers pick jobs up, so many uploads can be handled at once without overloading the API or hitting Azure Speech rate limits.
+- **Storage:** Audio and transcripts (as JSON) go in Blob Storage. Job details (status, attempts, file paths) go in a small database table.
+- **Failures:** Temporary errors are retried with increasing delays. If a worker crashes, Service Bus delivers the job again. Jobs that keep failing go to a dead-letter queue and are marked Failed.
+- **API:** `POST` creates a job and returns the upload URL. `GET` returns the status and, once done, the transcript. Clients can also pass a callback URL to be notified when it's ready.
 
 ## Getting started
 
@@ -79,3 +99,8 @@ You'll get back something like:
 ```
 
 Times are in seconds from the start of the recording. If the file isn't valid audio, you'll get a `400` with a short message explaining why.
+
+## Notes
+
+- Keep your real Azure key out of source control. You can also set it with an environment variable (`AzureSpeech__Key`), which overrides `appsettings.json`.
+- Chunks are transcribed one after another. Sending them in parallel would speed up long files.
